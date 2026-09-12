@@ -1981,6 +1981,9 @@ function stopTicking(dayId) {
 
 /* ---------------- rendering ---------------- */
 function render() {
+  const prevScroll = document.querySelector('.scroll-area');
+  const scrollTop = prevScroll ? prevScroll.scrollTop : 0;
+
   root.innerHTML = '';
   const app = el(`<div class="app"></div>`);
 
@@ -2014,6 +2017,7 @@ function render() {
   app.appendChild(scroll);
 
   root.appendChild(app);
+  scroll.scrollTop = scrollTop;
 }
 
 function renderWorkoutView() {
