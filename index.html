@@ -2558,7 +2558,19 @@ root.addEventListener('click', (e) => {
         render();
         break;
       }
-      if (open) state.openDayIds.delete(dayId); else state.openDayIds.add(dayId);
+      if (open) {
+        state.openDayIds.delete(dayId);
+        // Collapsing the card pauses the session — stop its timer too.
+        stopTimerIfRunning(dayId);
+      } else {
+        state.openDayIds.add(dayId);
+        // Opening a day card starts the session — auto-start its timer
+        // so the user doesn't have to remember to tap play separately.
+        const t = getTimerState(dayId);
+        if (!t.running) {
+          setTimerState(dayId, { running: true, startedAt: Date.now() });
+        }
+      }
       render();
       break;
     }
