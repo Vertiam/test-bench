@@ -691,7 +691,7 @@ const BRO_SPLIT = [
           },
           {
             "id": "bro-sho-w-3",
-            "name": "Lateral Raises",
+            "name": "Lean-In Lateral Raises",
             "url": "https://www.youtube.com/watch?v=SgyUoY0IZ7A",
             "setsReps": "4 \u00d7 12\u201315",
             "prKey": "lateral-raises",
@@ -1009,7 +1009,7 @@ const PPL_SPLIT = [
           },
           {
             "id": "ppl-pa-w-6",
-            "name": "Lateral Raises",
+            "name": "Lean-In Lateral Raises",
             "url": "https://www.youtube.com/watch?v=SgyUoY0IZ7A",
             "setsReps": "3 \u00d7 12\u201315",
             "prKey": "lateral-raises",
@@ -1350,7 +1350,7 @@ const PPL_SPLIT = [
           },
           {
             "id": "ppl-pb-w-2",
-            "name": "Lateral Raises",
+            "name": "Lean-In Lateral Raises",
             "url": "https://www.youtube.com/watch?v=SgyUoY0IZ7A",
             "setsReps": "4 \u00d7 12\u201315",
             "prKey": "lateral-raises",
@@ -1966,6 +1966,14 @@ function resetTimer(dayId) {
   stopTicking(dayId);
   setTimerState(dayId, { elapsed: 0, running: false, startedAt: null });
 }
+function stopTimerIfRunning(dayId) {
+  const t = getTimerState(dayId);
+  if (t.running) {
+    const total = currentElapsed(t);
+    setTimerState(dayId, { elapsed: total, running: false, startedAt: null });
+  }
+  stopTicking(dayId);
+}
 function startTicking(dayId, displayEl) {
   stopTicking(dayId);
   timerTickHandles[dayId] = setInterval(() => {
@@ -2240,10 +2248,29 @@ function renderDayCard(day) {
         <textarea class="note-textarea" rows="2" placeholder="How'd it feel? Energy, soreness, anything to remember...">${notes[noteKey] || ''}</textarea>
       </div>
     `);
-    noteBlock.querySelector('textarea').addEventListener('input', (e) => {
+    const dayNoteTextarea = noteBlock.querySelector('textarea');
+    dayNoteTextarea.addEventListener('input', (e) => {
       const cur = readJSON('fit_notes', {});
       cur[noteKey] = e.target.value;
       writeJSON('fit_notes', cur);
+    });
+    // Treat leaving the note field (with saved content) as "note saved"
+    // for this session, and stop the day's timer accordingly.
+    dayNoteTextarea.addEventListener('blur', () => {
+      const cur = readJSON('fit_notes', {});
+      if (cur[noteKey] && cur[noteKey].trim()) {
+        stopTimerIfRunning(day.id);
+        const displayEl = document.querySelector(`[data-timer-display="${day.id}"]`);
+        if (displayEl) {
+          displayEl.textContent = formatDuration(currentElapsed(getTimerState(day.id)));
+          displayEl.classList.remove('running');
+        }
+        const toggleBtn = document.getElementById('timerToggleBtn');
+        if (toggleBtn && !state.noteSheet) {
+          toggleBtn.innerHTML = ICON.playSm;
+          toggleBtn.title = 'Start';
+        }
+      }
     });
     body.appendChild(noteBlock);
 
@@ -2401,6 +2428,7 @@ function renderExerciseRow(day, exercise, checked, weights) {
 
   if (hasPR) {
     const input = row.querySelector('.weight-input');
+    const badge = row.querySelector('.pr-badge');
     input.addEventListener('click', (e) => e.stopPropagation());
     input.addEventListener('input', (e) => {
       const raw = e.target.value;
@@ -2408,6 +2436,34 @@ function renderExerciseRow(day, exercise, checked, weights) {
       cur[exercise.prKey] = raw;
       writeJSON('fit_weights', cur);
 
+      // Update the badge in place instead of calling render(), so the
+      // input never gets torn down/recreated mid-keystroke (that was
+      // what dismissed the keyboard after every digit and caused the
+      // page-wide "blink").
+      const val = parseFloat(raw) || 0;
+      const currentPR = state.prs[exercise.prKey] ?? 0;
+      if (badge) {
+        if (val > 0 && val > currentPR) {
+          badge.className = 'pr-badge new';
+          badge.innerHTML = `${ICON.trophy} New PR`;
+        } else if (currentPR > 0) {
+          badge.className = 'pr-badge set';
+          badge.innerHTML = `PR ${currentPR}kg`;
+        } else if (val > 0) {
+          badge.className = 'pr-badge first';
+          badge.innerHTML = `${ICON.target} First rep`;
+        } else {
+          badge.className = 'pr-badge none';
+          badge.innerHTML = 'No PR yet';
+        }
+      }
+    });
+
+    // Commit the new PR (and trigger the full re-render / celebration)
+    // only once the user is done editing — on blur or Enter — not on
+    // every keystroke.
+    const commitPR = () => {
+      const raw = input.value;
       const val = parseFloat(raw);
       const currentPR = state.prs[exercise.prKey] ?? 0;
       if (val > 0 && val > currentPR) {
@@ -2415,9 +2471,13 @@ function renderExerciseRow(day, exercise, checked, weights) {
         state.prs = nextPRs;
         writeJSON('fit_prs', nextPRs);
         state.newPRs.add(exercise.prKey);
+        render();
         setTimeout(() => { state.newPRs.delete(exercise.prKey); render(); }, 3000);
       }
-      render();
+    };
+    input.addEventListener('blur', commitPR);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
     });
   }
 
@@ -2532,6 +2592,8 @@ function renderNoteSheetIfNeeded() {
     cur[state.noteSheet.noteKey] = trimmed;
     writeJSON('fit_notes', cur);
     const dayId = state.noteSheet.dayId;
+    // Saving the note ends the session, so stop that day's timer too.
+    stopTimerIfRunning(dayId);
     state.openDayIds.delete(dayId);
     state.noteSheet = null;
     render();
