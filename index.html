@@ -1987,12 +1987,17 @@ function stopTicking(dayId) {
   if (timerTickHandles[dayId]) { clearInterval(timerTickHandles[dayId]); delete timerTickHandles[dayId]; }
 }
 
-/* ---------------- rendering ---------------- */
-function render() {
-  const prevScroll = document.querySelector('.scroll-area');
-  const scrollTop = prevScroll ? prevScroll.scrollTop : 0;
-
-  root.innerHTML = '';
+/* ---------------- rendering ----------------
+   All click handling is delegated to a single listener on #root (see
+   "event delegation" section below), keyed by data-action attributes.
+   That means render() never needs to re-attach per-element listeners,
+   so it's safe to diff/patch the DOM in place instead of wiping and
+   rebuilding it — which is what caused the visible "blink" on every
+   interaction (checking off an exercise, toggling a switch, opening a
+   day card, etc.): root.innerHTML = '' destroyed and recreated every
+   node in the app on every single state change.
+------------------------------------------------------------------- */
+function renderApp() {
   const app = el(`<div class="app"></div>`);
 
   const header = el(`
@@ -2002,7 +2007,7 @@ function render() {
         <h1 class="app-title">${state.view === 'history' ? 'History' : 'Workout tracker'}</h1>
       </div>
       <div class="header-right">
-        <button class="icon-btn tap-scale" id="viewToggleBtn" aria-label="Toggle history view">
+        <button class="icon-btn tap-scale" id="viewToggleBtn" data-action="toggle-view" aria-label="Toggle history view">
           ${state.view === 'workout' ? ICON.history : ICON.dumbbell}
         </button>
         <div>
@@ -2012,10 +2017,6 @@ function render() {
       </div>
     </div>
   `);
-  header.querySelector('#viewToggleBtn').addEventListener('click', () => {
-    state.view = state.view === 'workout' ? 'history' : 'workout';
-    render();
-  });
   app.appendChild(header);
   app.appendChild(el(`<div class="divider"></div>`));
 
@@ -2024,8 +2025,66 @@ function render() {
   scroll.appendChild(el(`<div style="height:24px"></div>`));
   app.appendChild(scroll);
 
-  root.appendChild(app);
-  scroll.scrollTop = scrollTop;
+  return app;
+}
+
+/* Reconcile `next` into `live` in place: reuse existing nodes wherever
+   possible (preserving focus, caret position, open keyboard, scroll,
+   CSS transition state, etc.) instead of replacing them. Falls back to
+   a full node swap only when tag/type genuinely differs. */
+function patchDOM(live, next) {
+  if (next.nodeType === Node.TEXT_NODE) {
+    if (live.nodeType !== Node.TEXT_NODE) { live.replaceWith(next); return next; }
+    if (live.textContent !== next.textContent) live.textContent = next.textContent;
+    return live;
+  }
+
+  if (live.nodeType !== Node.ELEMENT_NODE || live.nodeName !== next.nodeName) {
+    live.replaceWith(next);
+    return next;
+  }
+
+  const isFormEl = live.nodeName === 'INPUT' || live.nodeName === 'TEXTAREA';
+  const isFocused = document.activeElement === live;
+
+  const liveAttrs = Array.from(live.attributes || []);
+  const nextAttrs = Array.from(next.attributes || []);
+  liveAttrs.forEach((attr) => { if (!next.hasAttribute(attr.name)) live.removeAttribute(attr.name); });
+  nextAttrs.forEach((attr) => { if (live.getAttribute(attr.name) !== attr.value) live.setAttribute(attr.name, attr.value); });
+
+  // Don't stomp on a value the user is actively typing into.
+  if (isFormEl && !isFocused && live.value !== next.value) live.value = next.value;
+
+  const nextKids = Array.from(next.childNodes);
+  const max = Math.max(live.childNodes.length, nextKids.length);
+  for (let i = 0; i < max; i++) {
+    const lk = live.childNodes[i];
+    const nk = nextKids[i];
+    if (lk && nk) patchDOM(lk, nk);
+    else if (!lk && nk) live.appendChild(nk);
+    else if (lk && !nk) lk.remove();
+  }
+
+  return live;
+}
+
+function render() {
+  const prevScroll = document.querySelector('.scroll-area');
+  const scrollTop = prevScroll ? prevScroll.scrollTop : 0;
+
+  const nextApp = renderApp();
+  const liveApp = root.querySelector('.app');
+
+  if (!liveApp) {
+    root.appendChild(nextApp);
+  } else {
+    patchDOM(liveApp, nextApp);
+  }
+
+  const scroll = root.querySelector('.scroll-area');
+  if (scroll) scroll.scrollTop = scrollTop;
+
+  renderNoteSheetIfNeeded();
 }
 
 function renderWorkoutView() {
@@ -2055,18 +2114,12 @@ function renderWorkoutView() {
   const toggleRow = el(`
     <div class="split-toggle-row">
       <span class="split-toggle-label ${state.split === 'bro' ? 'active' : ''}">Bro</span>
-      <button class="switch switch-lg ${state.split === 'ppl' ? 'on' : ''}" style="--switch-travel:24px" id="splitSwitch" role="switch" aria-checked="${state.split === 'ppl'}" aria-label="Toggle split">
+      <button class="switch switch-lg ${state.split === 'ppl' ? 'on' : ''}" style="--switch-travel:24px" id="splitSwitch" data-action="toggle-split" role="switch" aria-checked="${state.split === 'ppl'}" aria-label="Toggle split">
         <span class="switch-knob"></span>
       </button>
       <span class="split-toggle-label ${state.split === 'ppl' ? 'active' : ''}">PPL</span>
     </div>
   `);
-  toggleRow.querySelector('#splitSwitch').addEventListener('click', () => {
-    state.split = state.split === 'bro' ? 'ppl' : 'bro';
-    localStorage.setItem('fit_split', state.split);
-    state.openDayIds.clear();
-    render();
-  });
   wrap.appendChild(toggleRow);
 
   wrap.appendChild(el(`<p class="schedule-text">${SPLIT_SCHEDULE[state.split]}</p>`));
@@ -2103,12 +2156,6 @@ function renderSupplementsCard() {
   const proteinPct = entry.protein > 0 ? Math.min((entry.protein / 120) * 100, 100) : 0;
   const dateLabel = new Date(today + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', day: 'numeric', month: 'short' });
 
-  const update = (patch) => {
-    const cur = readJSON('fit_supps', {});
-    const next = { ...cur, [today]: { ...(cur[today] || { creatine: false, protein: 0 }), ...patch } };
-    writeJSON('fit_supps', next);
-  };
-
   const card = el(`
     <div class="supp-card">
       <div class="supp-head">
@@ -2120,7 +2167,7 @@ function renderSupplementsCard() {
           <span class="supp-icon" style="color:var(--ember-500)">${ICON.pill}</span>
           <span class="supp-label">Creatine</span>
         </div>
-        <button class="switch switch-sm ${entry.creatine ? 'on' : ''}" style="--switch-travel:20px" id="creatineSwitch" role="switch" aria-checked="${entry.creatine}" aria-label="Toggle creatine taken">
+        <button class="switch switch-sm ${entry.creatine ? 'on' : ''}" style="--switch-travel:20px" id="creatineSwitch" data-action="toggle-creatine" role="switch" aria-checked="${entry.creatine}" aria-label="Toggle creatine taken">
           <span class="switch-knob"></span>
         </button>
       </div>
@@ -2131,7 +2178,7 @@ function renderSupplementsCard() {
             <span class="supp-label">Protein</span>
           </div>
           <div class="supp-input-group">
-            <input type="number" inputmode="numeric" class="num-input" id="proteinInput" placeholder="0" value="${entry.protein || ''}">
+            <input type="number" inputmode="numeric" class="num-input" id="proteinInput" data-field="protein" placeholder="0" value="${entry.protein || ''}">
             <span class="unit-label">/ 120g</span>
           </div>
         </div>
@@ -2142,21 +2189,13 @@ function renderSupplementsCard() {
     </div>
   `);
 
-  card.querySelector('#creatineSwitch').addEventListener('click', (e) => {
-    update({ creatine: !entry.creatine });
-    render(); // re-render to reflect new state + keep everything in sync
-  });
-  const proteinInput = card.querySelector('#proteinInput');
-  proteinInput.addEventListener('input', (e) => {
-    const val = Number(e.target.value) || 0;
-    update({ protein: val });
-    const pct = val > 0 ? Math.min((val / 120) * 100, 100) : 0;
-    const fill = card.querySelector('#proteinFill');
-    fill.style.width = `${pct}%`;
-    fill.style.background = pct >= 100 ? 'linear-gradient(90deg,#e11d48,#fb7185)' : 'linear-gradient(90deg,#0ea5e9,#38bdf8)';
-  });
-
   return card;
+}
+function updateSupps(patch) {
+  const today = todayKey();
+  const cur = readJSON('fit_supps', {});
+  const next = { ...cur, [today]: { ...(cur[today] || { creatine: false, protein: 0 }), ...patch } };
+  writeJSON('fit_supps', next);
 }
 
 /* ---------------- day card ---------------- */
@@ -2193,7 +2232,7 @@ function renderDayCard(day) {
   }
 
   const head = el(`
-    <button class="day-card-head">
+    <button class="day-card-head" data-action="toggle-day" data-day-id="${day.id}">
       <div class="day-head-left">
         <div class="day-icon-badge ${complete ? 'complete' : ''}">${dayIconFor(day.id)}</div>
         <div style="text-align:left">
@@ -2217,17 +2256,6 @@ function renderDayCard(day) {
       </div>
     </button>
   `);
-
-  head.addEventListener('click', () => {
-    if (open && hasProgress && !hasNote) {
-      state.noteSheet = { dayId: day.id, noteKey };
-      state.noteDraft = '';
-      render();
-      return;
-    }
-    if (open) state.openDayIds.delete(day.id); else state.openDayIds.add(day.id);
-    render();
-  });
   card.appendChild(head);
 
   if (open) {
@@ -2245,41 +2273,12 @@ function renderDayCard(day) {
           <span class="note-label">Day note</span>
           ${hasProgress && !hasNote ? `<span class="note-required">Required to close</span>` : ''}
         </div>
-        <textarea class="note-textarea" rows="2" placeholder="How'd it feel? Energy, soreness, anything to remember...">${notes[noteKey] || ''}</textarea>
+        <textarea class="note-textarea" rows="2" data-field="day-note" data-note-key="${noteKey}" data-day-id="${day.id}" placeholder="How'd it feel? Energy, soreness, anything to remember...">${notes[noteKey] || ''}</textarea>
       </div>
     `);
-    const dayNoteTextarea = noteBlock.querySelector('textarea');
-    dayNoteTextarea.addEventListener('input', (e) => {
-      const cur = readJSON('fit_notes', {});
-      cur[noteKey] = e.target.value;
-      writeJSON('fit_notes', cur);
-    });
-    // Treat leaving the note field (with saved content) as "note saved"
-    // for this session, and stop the day's timer accordingly.
-    dayNoteTextarea.addEventListener('blur', () => {
-      const cur = readJSON('fit_notes', {});
-      if (cur[noteKey] && cur[noteKey].trim()) {
-        stopTimerIfRunning(day.id);
-        const displayEl = document.querySelector(`[data-timer-display="${day.id}"]`);
-        if (displayEl) {
-          displayEl.textContent = formatDuration(currentElapsed(getTimerState(day.id)));
-          displayEl.classList.remove('running');
-        }
-        const toggleBtn = document.getElementById('timerToggleBtn');
-        if (toggleBtn && !state.noteSheet) {
-          toggleBtn.innerHTML = ICON.playSm;
-          toggleBtn.title = 'Start';
-        }
-      }
-    });
     body.appendChild(noteBlock);
 
-    const resetBtn = el(`<button class="reset-btn">Reset day</button>`);
-    resetBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      writeJSON(`fit_checks_${day.id}`, {});
-      render();
-    });
+    const resetBtn = el(`<button class="reset-btn" data-action="reset-day" data-day-id="${day.id}">Reset day</button>`);
     body.appendChild(resetBtn);
 
     card.appendChild(body);
@@ -2303,36 +2302,11 @@ function renderTimerBox(dayId) {
         </div>
       </div>
       <div class="timer-controls">
-        <button class="timer-btn tap-scale" id="timerResetBtn" aria-label="Reset timer" title="Reset">${ICON.reset}</button>
-        <button class="timer-btn primary tap-scale" id="timerToggleBtn" aria-label="${t.running ? 'Pause timer' : 'Start timer'}" title="${t.running ? 'Pause' : 'Start'}">${t.running ? ICON.pause : ICON.playSm}</button>
+        <button class="timer-btn tap-scale" id="timerResetBtn" data-action="reset-timer" data-day-id="${dayId}" aria-label="Reset timer" title="Reset">${ICON.reset}</button>
+        <button class="timer-btn primary tap-scale" id="timerToggleBtn" data-action="toggle-timer" data-day-id="${dayId}" aria-label="${t.running ? 'Pause timer' : 'Start timer'}" title="${t.running ? 'Pause' : 'Start'}">${t.running ? ICON.pause : ICON.playSm}</button>
       </div>
     </div>
   `);
-
-  box.querySelector('#timerToggleBtn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    toggleTimer(dayId);
-    // patch just the button + display in place, no full re-render needed
-    const nowState = getTimerState(dayId);
-    const displayEl = box.querySelector(`[data-timer-display="${dayId}"]`);
-    displayEl.textContent = formatDuration(currentElapsed(nowState));
-    displayEl.classList.toggle('running', nowState.running);
-    const btn = box.querySelector('#timerToggleBtn');
-    btn.innerHTML = nowState.running ? ICON.pause : ICON.playSm;
-    btn.title = nowState.running ? 'Pause' : 'Start';
-    if (nowState.running) startTicking(dayId);
-  });
-
-  box.querySelector('#timerResetBtn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    resetTimer(dayId);
-    const displayEl = box.querySelector(`[data-timer-display="${dayId}"]`);
-    displayEl.textContent = formatDuration(0);
-    displayEl.classList.remove('running');
-    const btn = box.querySelector('#timerToggleBtn');
-    btn.innerHTML = ICON.playSm;
-    btn.title = 'Start';
-  });
 
   if (t.running) startTicking(dayId);
 
@@ -2352,7 +2326,7 @@ function renderExerciseSection(day, section, checks, weights) {
 
   const wrap = el(`<div class="exsec"></div>`);
   const head = el(`
-    <button class="exsec-head" style="background:${collapsed && allDone ? tint + '16' : 'rgba(255,255,255,.03)'}">
+    <button class="exsec-head" data-action="toggle-section" data-section-key="${collapsedKey}" style="background:${collapsed && allDone ? tint + '16' : 'rgba(255,255,255,.03)'}">
       <div class="exsec-head-left">
         <span class="exsec-icon" style="color:${tint}">${secIcon}</span>
         <span class="exsec-title" style="color:${tint}">${section.title}</span>
@@ -2361,10 +2335,6 @@ function renderExerciseSection(day, section, checks, weights) {
       ${allDone ? `<span style="color:var(--ember-500)">${ICON.check}</span>` : `<span class="chev" style="transform:rotate(${collapsed ? 0 : 180}deg)">${ICON.chevron}</span>`}
     </button>
   `);
-  head.addEventListener('click', () => {
-    state[collapsedKey] = !state[collapsedKey];
-    render();
-  });
   wrap.appendChild(head);
 
   if (!collapsed) {
@@ -2388,12 +2358,12 @@ function renderExerciseRow(day, exercise, checked, weights) {
 
   const row = el(`
     <div class="ex-row ${checked ? 'checked' : ''}">
-      <button class="ex-check tap-scale ${checked ? 'checked' : ''}" aria-label="${checked ? 'Mark incomplete' : 'Mark complete'}">
+      <button class="ex-check tap-scale ${checked ? 'checked' : ''}" data-action="toggle-exercise" data-day-id="${day.id}" data-exercise-id="${exercise.id}" aria-label="${checked ? 'Mark incomplete' : 'Mark complete'}">
         <span class="ex-check-box">${checked ? ICON.check : ''}</span>
       </button>
       <div class="ex-content">
         <div class="ex-top">
-          <button class="watch-btn" title="Watch demo">${ICON.play} Demo</button>
+          <button class="watch-btn" data-action="watch-demo" data-url="${exercise.url}" title="Watch demo">${ICON.play} Demo</button>
           <span class="ex-name">${exercise.name}</span>
           ${exercise.setsReps ? `<span class="ex-setsreps">${exercise.setsReps}</span>` : ''}
         </div>
@@ -2401,7 +2371,7 @@ function renderExerciseRow(day, exercise, checked, weights) {
         ${hasPR ? `
           <div class="pr-row">
             <div class="weight-input-group">
-              <input type="number" step="0.5" min="0" class="weight-input" placeholder="0" value="${weightValue}">
+              <input type="number" step="0.5" min="0" class="weight-input" data-field="pr-weight" data-pr-key="${exercise.prKey}" placeholder="0" value="${weightValue}">
               <span class="weight-unit">kg</span>
             </div>
             <div class="pr-badge ${isNewPR ? 'new' : prValue > 0 ? 'set' : numeric > 0 ? 'first' : 'none'}">
@@ -2413,73 +2383,6 @@ function renderExerciseRow(day, exercise, checked, weights) {
       </div>
     </div>
   `);
-
-  row.querySelector('.ex-check').addEventListener('click', () => {
-    const cur = readJSON(`fit_checks_${day.id}`, {});
-    cur[exercise.id] = !cur[exercise.id];
-    writeJSON(`fit_checks_${day.id}`, cur);
-    render();
-  });
-
-  row.querySelector('.watch-btn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    window.open(exercise.url, '_blank', 'noopener,noreferrer');
-  });
-
-  if (hasPR) {
-    const input = row.querySelector('.weight-input');
-    const badge = row.querySelector('.pr-badge');
-    input.addEventListener('click', (e) => e.stopPropagation());
-    input.addEventListener('input', (e) => {
-      const raw = e.target.value;
-      const cur = readJSON('fit_weights', {});
-      cur[exercise.prKey] = raw;
-      writeJSON('fit_weights', cur);
-
-      // Update the badge in place instead of calling render(), so the
-      // input never gets torn down/recreated mid-keystroke (that was
-      // what dismissed the keyboard after every digit and caused the
-      // page-wide "blink").
-      const val = parseFloat(raw) || 0;
-      const currentPR = state.prs[exercise.prKey] ?? 0;
-      if (badge) {
-        if (val > 0 && val > currentPR) {
-          badge.className = 'pr-badge new';
-          badge.innerHTML = `${ICON.trophy} New PR`;
-        } else if (currentPR > 0) {
-          badge.className = 'pr-badge set';
-          badge.innerHTML = `PR ${currentPR}kg`;
-        } else if (val > 0) {
-          badge.className = 'pr-badge first';
-          badge.innerHTML = `${ICON.target} First rep`;
-        } else {
-          badge.className = 'pr-badge none';
-          badge.innerHTML = 'No PR yet';
-        }
-      }
-    });
-
-    // Commit the new PR (and trigger the full re-render / celebration)
-    // only once the user is done editing — on blur or Enter — not on
-    // every keystroke.
-    const commitPR = () => {
-      const raw = input.value;
-      const val = parseFloat(raw);
-      const currentPR = state.prs[exercise.prKey] ?? 0;
-      if (val > 0 && val > currentPR) {
-        const nextPRs = { ...state.prs, [exercise.prKey]: val };
-        state.prs = nextPRs;
-        writeJSON('fit_prs', nextPRs);
-        state.newPRs.add(exercise.prKey);
-        render();
-        setTimeout(() => { state.newPRs.delete(exercise.prKey); render(); }, 3000);
-      }
-    };
-    input.addEventListener('blur', commitPR);
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-    });
-  }
 
   return row;
 }
@@ -2592,7 +2495,6 @@ function renderNoteSheetIfNeeded() {
     cur[state.noteSheet.noteKey] = trimmed;
     writeJSON('fit_notes', cur);
     const dayId = state.noteSheet.dayId;
-    // Saving the note ends the session, so stop that day's timer too.
     stopTimerIfRunning(dayId);
     state.openDayIds.delete(dayId);
     state.noteSheet = null;
@@ -2603,14 +2505,227 @@ function renderNoteSheetIfNeeded() {
   textarea.focus();
 }
 
-/* ---------------- boot ---------------- */
-function fullRender() {
-  render();
-  renderNoteSheetIfNeeded();
-}
-const _origRender = render;
-render = function () { _origRender(); renderNoteSheetIfNeeded(); };
+/* ---------------- delegated event handling ----------------
+   One listener per event type on #root, instead of attaching a fresh
+   listener to every element every render. This is what makes it safe
+   for render() to patch the DOM in place (see patchDOM above) rather
+   than rebuild it from scratch: since nothing here depends on which
+   physical node the browser kept, patched-in nodes stay fully
+   interactive with zero re-wiring.
+------------------------------------------------------------------- */
+root.addEventListener('click', (e) => {
+  const actionEl = e.target.closest('[data-action]');
+  if (!actionEl) return;
+  const action = actionEl.dataset.action;
 
+  switch (action) {
+    case 'toggle-view': {
+      state.view = state.view === 'workout' ? 'history' : 'workout';
+      render();
+      break;
+    }
+    case 'toggle-split': {
+      state.split = state.split === 'bro' ? 'ppl' : 'bro';
+      localStorage.setItem('fit_split', state.split);
+      state.openDayIds.clear();
+      render();
+      break;
+    }
+    case 'toggle-creatine': {
+      const today = todayKey();
+      const allSupps = readJSON('fit_supps', {});
+      const entry = allSupps[today] || { creatine: false, protein: 0 };
+      updateSupps({ creatine: !entry.creatine });
+      render();
+      break;
+    }
+    case 'toggle-day': {
+      e.stopPropagation();
+      const dayId = actionEl.dataset.dayId;
+      const days = state.split === 'ppl' ? PPL_SPLIT : BRO_SPLIT;
+      const day = days.find((d) => d.id === dayId);
+      const open = state.openDayIds.has(dayId);
+      const checks = readJSON(`fit_checks_${dayId}`, {});
+      const notes = readJSON('fit_notes', {});
+      const totalDone = day.sections.reduce((sum, s) => sum + s.exercises.filter((ex) => checks[ex.id]).length, 0);
+      const hasProgress = totalDone > 0;
+      const noteKey = `${todayKey()}_${dayId}`;
+      const hasNote = !!(notes[noteKey] && notes[noteKey].trim());
+
+      if (open && hasProgress && !hasNote) {
+        state.noteSheet = { dayId, noteKey };
+        state.noteDraft = '';
+        render();
+        break;
+      }
+      if (open) state.openDayIds.delete(dayId); else state.openDayIds.add(dayId);
+      render();
+      break;
+    }
+    case 'reset-day': {
+      e.stopPropagation();
+      const dayId = actionEl.dataset.dayId;
+      writeJSON(`fit_checks_${dayId}`, {});
+      render();
+      break;
+    }
+    case 'toggle-timer': {
+      e.stopPropagation();
+      const dayId = actionEl.dataset.dayId;
+      toggleTimer(dayId);
+      // Patch just the button + display in place, no full re-render needed.
+      const nowState = getTimerState(dayId);
+      const displayEl = document.querySelector(`[data-timer-display="${dayId}"]`);
+      if (displayEl) {
+        displayEl.textContent = formatDuration(currentElapsed(nowState));
+        displayEl.classList.toggle('running', nowState.running);
+      }
+      actionEl.innerHTML = nowState.running ? ICON.pause : ICON.playSm;
+      actionEl.title = nowState.running ? 'Pause' : 'Start';
+      if (nowState.running) startTicking(dayId);
+      break;
+    }
+    case 'reset-timer': {
+      e.stopPropagation();
+      const dayId = actionEl.dataset.dayId;
+      resetTimer(dayId);
+      const displayEl = document.querySelector(`[data-timer-display="${dayId}"]`);
+      if (displayEl) {
+        displayEl.textContent = formatDuration(0);
+        displayEl.classList.remove('running');
+      }
+      const toggleBtn = document.querySelector(`[data-action="toggle-timer"][data-day-id="${dayId}"]`);
+      if (toggleBtn) { toggleBtn.innerHTML = ICON.playSm; toggleBtn.title = 'Start'; }
+      break;
+    }
+    case 'toggle-section': {
+      const key = actionEl.dataset.sectionKey;
+      state[key] = !state[key];
+      render();
+      break;
+    }
+    case 'toggle-exercise': {
+      const dayId = actionEl.dataset.dayId;
+      const exerciseId = actionEl.dataset.exerciseId;
+      const cur = readJSON(`fit_checks_${dayId}`, {});
+      cur[exerciseId] = !cur[exerciseId];
+      writeJSON(`fit_checks_${dayId}`, cur);
+      render();
+      break;
+    }
+    case 'watch-demo': {
+      e.stopPropagation();
+      window.open(actionEl.dataset.url, '_blank', 'noopener,noreferrer');
+      break;
+    }
+  }
+});
+
+root.addEventListener('click', (e) => {
+  // Prevent the PR weight input's own click from bubbling up into
+  // the exercise row / day-card toggle handlers.
+  if (e.target.matches('[data-field="pr-weight"]')) e.stopPropagation();
+}, true);
+
+root.addEventListener('input', (e) => {
+  const field = e.target.dataset ? e.target.dataset.field : null;
+  if (!field) return;
+
+  if (field === 'protein') {
+    const val = Number(e.target.value) || 0;
+    updateSupps({ protein: val });
+    const pct = val > 0 ? Math.min((val / 120) * 100, 100) : 0;
+    const fill = document.getElementById('proteinFill');
+    if (fill) {
+      fill.style.width = `${pct}%`;
+      fill.style.background = pct >= 100 ? 'linear-gradient(90deg,#e11d48,#fb7185)' : 'linear-gradient(90deg,#0ea5e9,#38bdf8)';
+    }
+    return;
+  }
+
+  if (field === 'day-note') {
+    const noteKey = e.target.dataset.noteKey;
+    const cur = readJSON('fit_notes', {});
+    cur[noteKey] = e.target.value;
+    writeJSON('fit_notes', cur);
+    return;
+  }
+
+  if (field === 'pr-weight') {
+    const prKey = e.target.dataset.prKey;
+    const raw = e.target.value;
+    const cur = readJSON('fit_weights', {});
+    cur[prKey] = raw;
+    writeJSON('fit_weights', cur);
+
+    // Update the badge in place — never call render() here, or the
+    // input gets torn down/recreated mid-keystroke, which is what
+    // dismissed the keyboard after every digit and caused the blink.
+    const val = parseFloat(raw) || 0;
+    const currentPR = state.prs[prKey] ?? 0;
+    const badge = e.target.closest('.ex-content')?.querySelector('.pr-badge');
+    if (badge) {
+      if (val > 0 && val > currentPR) {
+        badge.className = 'pr-badge new';
+        badge.innerHTML = `${ICON.trophy} New PR`;
+      } else if (currentPR > 0) {
+        badge.className = 'pr-badge set';
+        badge.innerHTML = `PR ${currentPR}kg`;
+      } else if (val > 0) {
+        badge.className = 'pr-badge first';
+        badge.innerHTML = `${ICON.target} First rep`;
+      } else {
+        badge.className = 'pr-badge none';
+        badge.innerHTML = 'No PR yet';
+      }
+    }
+  }
+});
+
+root.addEventListener('blur', (e) => {
+  const field = e.target.dataset ? e.target.dataset.field : null;
+  if (!field) return;
+
+  if (field === 'pr-weight') {
+    const prKey = e.target.dataset.prKey;
+    const val = parseFloat(e.target.value);
+    const currentPR = state.prs[prKey] ?? 0;
+    if (val > 0 && val > currentPR) {
+      const nextPRs = { ...state.prs, [prKey]: val };
+      state.prs = nextPRs;
+      writeJSON('fit_prs', nextPRs);
+      state.newPRs.add(prKey);
+      render();
+      setTimeout(() => { state.newPRs.delete(prKey); render(); }, 3000);
+    }
+    return;
+  }
+
+  if (field === 'day-note') {
+    const dayId = e.target.dataset.dayId;
+    const noteKey = e.target.dataset.noteKey;
+    const cur = readJSON('fit_notes', {});
+    if (cur[noteKey] && cur[noteKey].trim()) {
+      stopTimerIfRunning(dayId);
+      const displayEl = document.querySelector(`[data-timer-display="${dayId}"]`);
+      if (displayEl) {
+        displayEl.textContent = formatDuration(currentElapsed(getTimerState(dayId)));
+        displayEl.classList.remove('running');
+      }
+      const toggleBtn = document.querySelector(`[data-action="toggle-timer"][data-day-id="${dayId}"]`);
+      if (toggleBtn) { toggleBtn.innerHTML = ICON.playSm; toggleBtn.title = 'Start'; }
+    }
+  }
+}, true); // capture phase: blur doesn't bubble, so we must catch it on the way down
+
+root.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.matches('[data-field="pr-weight"]')) {
+    e.preventDefault();
+    e.target.blur();
+  }
+});
+
+/* ---------------- boot ---------------- */
 render();
 
 </script>
